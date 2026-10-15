@@ -14,6 +14,8 @@ const {
 } = require(`../utils/get-monorepo-package-json-path`)
 const { registerCleanupTask } = require(`./cleanup-tasks`)
 
+const DEPENDENCY_FIELDS = [`dependencies`, `optionalDependencies`]
+
 /**
  * Edit package.json to:
  *  - adjust version to temporary one
@@ -27,7 +29,7 @@ const adjustPackageJson = ({
   versionPostFix,
   packagesToPublish,
   ignorePackageJSONChanges,
-  root,
+  packageNameToPath,
 }) => {
   // we need to check if package depend on any other package to will be published and
   // adjust version selector to point to dev version of package so local registry is used
@@ -41,21 +43,32 @@ const adjustPackageJson = ({
 
   monorepoPKGjson.version = `${monorepoPKGjson.version}-dev-${versionPostFix}`
   packagesToPublish.forEach(packageThatWillBePublished => {
-    if (
-      monorepoPKGjson.dependencies &&
-      monorepoPKGjson.dependencies[packageThatWillBePublished]
-    ) {
-      const currentVersion = JSON.parse(
-        fs.readFileSync(
-          getMonorepoPackageJsonPath({
-            packageName: packageThatWillBePublished,
-            root,
-          }),
-          `utf-8`
-        )
-      ).version
+    // `optionalDependencies` matters as much as `dependencies` here: a range left
+    // pointing at a version that isn't on npm yet (as on a release PR) can't be
+    // satisfied from the local registry either, because what we publish there is a
+    // `-dev-` prerelease and a caret range won't match a prerelease.
+    const fieldsToAdjust = DEPENDENCY_FIELDS.filter(
+      field =>
+        monorepoPKGjson[field] &&
+        monorepoPKGjson[field][packageThatWillBePublished]
+    )
 
-      monorepoPKGjson.dependencies[
+    if (fieldsToAdjust.length === 0) {
+      return
+    }
+
+    const currentVersion = JSON.parse(
+      fs.readFileSync(
+        getMonorepoPackageJsonPath({
+          packageName: packageThatWillBePublished,
+          packageNameToPath,
+        }),
+        `utf-8`
+      )
+    ).version
+
+    for (const field of fieldsToAdjust) {
+      monorepoPKGjson[field][
         packageThatWillBePublished
       ] = `${currentVersion}-dev-${versionPostFix}`
     }
@@ -87,31 +100,36 @@ const adjustPackageJson = ({
  * This is `npm publish` (as in linked comment) and `yarn publish` requirement.
  * This is not verdaccio restriction.
  */
-const createTemporaryNPMRC = ({ pathToPackage }) => {
-  const NPMRCPath = path.join(pathToPackage, `.npmrc`)
-  fs.outputFileSync(NPMRCPath, NPMRCContent)
+const createTemporaryNPMRC = ({ pathToPackage, root }) => {
+  const NPMRCPathInPackage = path.join(pathToPackage, `.npmrc`)
+  fs.outputFileSync(NPMRCPathInPackage, NPMRCContent)
+
+  const NPMRCPathInRoot = path.join(root, `.npmrc`)
+  fs.outputFileSync(NPMRCPathInRoot, NPMRCContent)
 
   return registerCleanupTask(() => {
-    fs.removeSync(NPMRCPath)
+    fs.removeSync(NPMRCPathInPackage)
+    fs.removeSync(NPMRCPathInRoot)
   })
 }
 
 const publishPackage = async ({
   packageName,
   packagesToPublish,
-  root,
   versionPostFix,
   ignorePackageJSONChanges,
+  packageNameToPath,
+  root,
 }) => {
   const monoRepoPackageJsonPath = getMonorepoPackageJsonPath({
     packageName,
-    root,
+    packageNameToPath,
   })
 
   const { unadjustPackageJson, newPackageVersion } = adjustPackageJson({
     monoRepoPackageJsonPath,
     packageName,
-    root,
+    packageNameToPath,
     versionPostFix,
     packagesToPublish,
     ignorePackageJSONChanges,
@@ -119,7 +137,7 @@ const publishPackage = async ({
 
   const pathToPackage = path.dirname(monoRepoPackageJsonPath)
 
-  const uncreateTemporaryNPMRC = createTemporaryNPMRC({ pathToPackage })
+  const uncreateTemporaryNPMRC = createTemporaryNPMRC({ pathToPackage, root })
 
   // npm publish
   const publishCmd = [
